@@ -126,9 +126,10 @@ def inprocess_restart(train, args):
     return train
 
 
-def maybe_wrap_for_inprocess_restart(pretrain):
-
-    args = arguments.parse_args(ignore_unknown_args=True)
+def maybe_wrap_for_inprocess_restart(pretrain, args=None):
+    """Reuse entrypoint arguments when supplied, including custom parser extensions."""
+    if args is None:
+        args = arguments.parse_args(ignore_unknown_args=True)
 
     if args.inprocess_restart:
         pretrain = inprocess_restart(pretrain, args)

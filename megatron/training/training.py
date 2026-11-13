@@ -1669,7 +1669,7 @@ def pretrain(
 
     # Early fault tolerance setup - must be done before initialize_megatron
     # to enable monitoring of the initialization process
-    ft_integration.setup()
+    ft_integration.setup(args=get_args())
     timestamp_after_in_job_setup = time.time()
 
     # Multimodal MiMo seeds each module's RNG in its builder; a plain collection seeds stock here.

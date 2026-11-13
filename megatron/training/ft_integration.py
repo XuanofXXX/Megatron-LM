@@ -73,9 +73,10 @@ def get_rank_monitor_client() -> Optional[Any]:
     return _GLOBAL_RANK_MONITOR_CLIENT
 
 
-def setup() -> None:
-    """Initialize fault tolerance before initialize_megatron"""
-    args = arguments.parse_args(ignore_unknown_args=True)
+def setup(args=None) -> None:
+    """Initialize fault tolerance, optionally reusing entrypoint arguments."""
+    if args is None:
+        args = arguments.parse_args(ignore_unknown_args=True)
     if not args.enable_ft_package:
         return
 

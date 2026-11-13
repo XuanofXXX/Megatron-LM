@@ -82,6 +82,18 @@ def get_wandb_writer():
     return _GLOBAL_WANDB_WRITER
 
 
+def set_tensorboard_writer(writer):
+    """Replace the active writer; the caller manages the previous writer's lifetime."""
+    global _GLOBAL_TENSORBOARD_WRITER
+    _GLOBAL_TENSORBOARD_WRITER = writer
+
+
+def set_wandb_writer(writer):
+    """Replace the active writer; the caller manages the previous writer's lifetime."""
+    global _GLOBAL_WANDB_WRITER
+    _GLOBAL_WANDB_WRITER = writer
+
+
 def get_one_logger():
     """Return one logger. It can be None so no need
     to check if it is initialized."""
