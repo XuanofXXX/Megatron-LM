@@ -26,6 +26,8 @@ Torch 2.6 的普通 BF16 MoE/EARH 不需要 E8M0 dtype。Core 的
 `inference/quantization/mxfp8_tensor.py` 增加局部能力检查，避免未启用 MXFP8 时因
 缺少 `torch.float8_e8m0fnu` 而导入失败；真正使用 Triton MXFP8 时才检查该能力并报错。
 不用增加实验开关，也不改训练计算路径。
+checkpoint 的公共状态与分片读取也按 PyTorch API 能力选择本地读取入口，保留
+`no_dist=True` 语义，使 Torch 2.6 能恢复官方 `torch_dist` checkpoint。
 
 检查保存和恢复时使用新的输出目录。第二次运行把总训练步数从 4 增加到 6，
 因此显式使用当前参数重设学习率调度器；沿用原训练计划续训时无需该选项：
@@ -39,6 +41,63 @@ bash experiments/xcx/configs/baseline.sh \
     --save-interval 2 --ckpt-format torch_dist --train-iters 6 \
     --override-opt_param-scheduler
 ```
+
+## MoE 训练脚本
+
+真实数据训练只增加一个 template 和三个入口，均使用同一个官方 GPT 训练循环：
+
+| 脚本（`experiments/xcx/configs/`） | 用途 |
+| --- | --- |
+| `moe_pretrain_template.sh` | 公共模型、数据、torchrun、训练和输出配置 |
+| `pretrain_moe.sh` | 普通 MoE，官方 Aux |
+| `pretrain_earh.sh` | 相同配方，加 EARH 动态行与静态 router |
+| `pretrain_kl_aux.sh` | 普通 MoE，global KL、固定 beta=0.7、rho=0 |
+
+template 默认 BF16、local backend、Adam、RMSNorm/SwiGLU/RoPE，8 层、hidden=512、
+8 experts/top-2、序列长度 2048、global batch=32、10000 步。它是可修改的基础配方，
+没有复刻旧脚本的 Muon、融合算子、任务调度或完整论文实验配置。
+MoE 与 EARH 默认共用 `aux_loss`、系数 0.005；KL 保持相同系数。
+
+先设置数据和 tokenizer，再选入口。`DATA_PATH` 是已预处理的 `.bin/.idx` 文件前缀，
+不带后缀；`TOKENIZER_MODEL_PATH` 是本地 HuggingFace tokenizer 目录：
+
+```bash
+export DATA_PATH=/path/to/data/train_text_document
+export TOKENIZER_MODEL_PATH=/path/to/tokenizer
+export NPROC_PER_NODE=8 EP_SIZE=8
+
+OUTPUT_DIR=/path/to/runs/moe bash experiments/xcx/configs/pretrain_moe.sh
+OUTPUT_DIR=/path/to/runs/earh bash experiments/xcx/configs/pretrain_earh.sh
+OUTPUT_DIR=/path/to/runs/kl bash experiments/xcx/configs/pretrain_kl_aux.sh
+```
+
+模型和训练参数可直接改 template 默认值，或设置 `NUM_LAYERS`、`HIDDEN_SIZE`、
+`NUM_ATTN_HEADS`、`FFN_HIDDEN_SIZE`、`MOE_FFN_HIDDEN_SIZE`、`NUM_EXPERTS`、
+`MOE_TOPK`、`SEQ_LEN`、`MICRO_BATCH_SIZE`、`GLOBAL_BATCH_SIZE`、`TRAIN_ITERS`、
+`LR`、`MIN_LR`、`LR_WARMUP_ITERS`、`SEED`。并行使用 `TP_SIZE/PP_SIZE/CP_SIZE/EP_SIZE`。
+其余参数直接追加官方 CLI，重复的普通选项以后面的值为准；不使用 `EXTRA_ARGS` 字符串或 eval。
+切换与默认互斥的配置（如按 samples 训练）时，直接改 template 对应项。
+
+```bash
+# EARH detach-gate；其它梯度模式与 aux-free 参数沿用下方 EARH 说明。
+OUTPUT_DIR=/path/to/runs/earh-probe bash experiments/xcx/configs/pretrain_earh.sh \
+    --moe-router-grad-mode probe_only
+# Global KL 完整步反馈和动态 beta；范围、步长等沿用 KL Aux 说明。
+OUTPUT_DIR=/path/to/runs/kl-dynamic bash experiments/xcx/configs/pretrain_kl_aux.sh \
+    --moe-router-global-aux-mode previous_step --moe-router-sym-kl-loss-dynamic-beta
+```
+
+默认输出在已被 Git 忽略的 `runs/xcx/<入口名>/`，包含 checkpoints、TensorBoard 和
+dataset cache；每组实验设置独立 `OUTPUT_DIR`。续训显式追加
+`--load /path/to/runs/earh/checkpoints`。没有自动恢复、自动换优化器或 FP8 开关。
+`TRANSFORMER_IMPL=transformer_engine` 可选择官方 TE backend，grouped GEMM 等继续用
+原参数配置；当前实测配方仍为 local/Adam。
+
+多机设置相同的 `NNODES`、`NPROC_PER_NODE`、`MASTER_ADDR`、`MASTER_PORT`（默认 6000），
+每台分别设置 `NODE_RANK`，数据/tokenizer/输出路径应可被各节点访问。单机自动使用
+`--standalone`。加权 blend、多份 train/valid 数据可不设置 `DATA_PATH`，直接追加
+`--data-path 0.7 /prefix1 0.3 /prefix2` 或官方 `--train-data-path/--valid-data-path`。
+也可不设置 `TOKENIZER_MODEL_PATH`，直接追加 tokenizer 参数。
 
 ## 异步日志
 
@@ -481,7 +540,7 @@ packing/compiled reps/prefetch、gate-up、mean_orth 和正交 loss/update。
 | P1 | 只读 boundary 指标的余项 | `router_boundary_metrics.py` | 复用 observation；基础 logger 已有 top-k margin，目标 TensorMetrics 已有 router-health，补的是 tie、logit-std 归一化和 alpha 阈值比例等不同口径 |
 | P1 | 逐 expert gate/up/down 参数及梯度统计；weighted/unweighted activation、dead-neuron | `experts.py` 中 `_save_expert_param_stats`、`_save_unweighted_activation_stats`、`_save_dead_neuron_stats`；`moe_utils.py::track_moe_router_expert_metrics` | 延续现有 callback/指标文件，使用明确权重视图和观测点；TE 未暴露原始激活时明确限制，不为日志复制 fused forward |
 | P1 | EAR checkpoint → HF、HF 推理参考和离线对齐 | `scripts/distributed_checkpoints_convertor/conver_EAR_ckpt.sh`、`utils/parse-moe-vars-from-mcore-config.py`、`tasks/EAR_ANALYSIS/ear_hf.py` | 用目标 checkpoint API 读参数，转换器留在工具侧；线性 EAR 的折叠须保留 dtype 边界，gate-up 需要非线性 HF 参考，不能当静态线性 Router 导出 |
-| P1 / 验证而非重迁 | 真实训练配方、TE grouped + 目标 Muon、现有功能的组合范围 | `scripts/pretrain/moe_pretrain_template.sh`、`scripts/pretrain/run/EARpaper/`；本目录各批验证限制 | 只精选常用 EAR/EARH/KL 配方到 `configs/`，其余用目标 CLI；单列参数分组、split、LR/master、checkpoint 验证。目前主要实测 local backend/Adam，TE 和 emerging_optimizers 依赖环境未就绪 |
+| P1 / 验证而非重迁 | 正式长训配方、TE grouped + 目标 Muon、现有功能的组合范围 | `scripts/pretrain/moe_pretrain_template.sh`、`scripts/pretrain/run/EARpaper/`；本目录各批验证限制 | 公共 template 和 MoE/EARH/KL 三个入口已补齐，使用官方 CLI；正式长训配方、参数分组、split、LR/master 等仍需逐项对齐。目前主要实测 local backend/Adam，TE 和 emerging_optimizers 依赖环境未就绪 |
 | P2 | KERN、SigmoidAbs Router；top-k combine normalization / raw scores / sqrt；bias 的 RMS update | `router.py::SigmoidAbsRouter`、`moe_utils.py::topk_routing_with_score_function`、`get_updated_expert_bias(method='rms_norm')` | 先小 Router 子类和实验侧概率后处理；这些会改变主任务的选路/权重，不与仅改 Aux 梯度的 proxy 同批。目标已具备普通 aux-free expert bias，缺的是自定义变体 |
 | P2 | ERC loss、EHS / pairwise expert similarity | `moe_layer.py::_compute_erc_loss`；`router.py::_log_ehs_stats`；`experts.py::compute_local_expert_outputs_for_similarity` | ERC 是训练目标，EHS 是诊断，分批处理。源 EAR 的 `get_router_weight_matrix_for_loss()` 返回 None，不能把 ERC 直接当成既有 EAR 目标。反事实 expert 输出采样另评估开销 |
 | P2 | Routerless AoE（full/low rank）、Routing-Free、自适应 lambda、首批 bias 校准 | `router.py::RouterlessAoERouter`、`RoutingFreeRouter`；`experts.py::AoEGroupedMLP` | 先 full-rank 评分，再低秩 expert，再变活跃数及跨层 density/lambda；复用 MoESubmodules/dispatcher/finalize。变 token/expert 数和跨层状态比普通 TopK 更复杂 |
@@ -607,6 +666,13 @@ EARH 复现检查补充（2026-11-12）：先完成普通 global Aux 反馈与�
   mock-data 训练（A800、local backend、Adam）；KL 配置还保存了第 2 步 checkpoint。
   新增能力检查测试在 2.6 下 6 项通过、1 项因缺少 dtype 跳过；2.10 下 7 项通过，
   232 项实验回归及 GPU E8M0 字节转换 replay 通过。未变更 FP8 数值 kernel。
+
+- 训练 template：10 项脚本/原生参数检查通过，覆盖路径空格、覆盖默认项、aux-free、
+  per-split 数据、多机 rendezvous 和必需输入。Torch 2.6 下用本地 HF tokenizer 和
+  人工小型 indexed dataset（未启用 mock data）跑通 MoE、EARH、双卡 EP=2 global KL
+  三个入口及独立 train/valid 路径，均训练两步并保存 checkpoint。KL 从第 2 步恢复至
+  第 4 步，6 条 KL/beta 日志和负载指标步号连续；相应 PyTorch checkpoint API 兼容
+  保持 common/sharded load 的本地读取语义。未改模型、路由算法或训练循环。
 
 异步日志的 CPU 检查不依赖官方 GPU 单测 fixtures，可单独运行：
 
