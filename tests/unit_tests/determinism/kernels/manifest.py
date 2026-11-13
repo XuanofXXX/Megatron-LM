@@ -103,6 +103,14 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="xcx_ear_compiled_reps",
+        sources=("experiments/xcx/routers/ear_compiled_reps.py",),
+        tests=(K + "test_xcx_ear_reps.py",),
+        kind="torch.compile",
+        notes="Opt-in gate packing and original-size per-layer BMMs; probe dtype casts "
+              "stay outside compilation. Replays compare all source gradients under contention.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",
