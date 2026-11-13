@@ -44,60 +44,83 @@ bash experiments/xcx/configs/baseline.sh \
 
 ## MoE 训练脚本
 
-真实数据训练只增加一个 template 和三个入口，均使用同一个官方 GPT 训练循环：
+`configs/moe_pretrain_template.sh` 从 YuLan-Pretrain 的同名模板复制并适配，
+保留原来的变量名、参数分组、token 预算换算、实验命名、日志目录和自动续训。
+原来的 launch 脚本可以继续 export 同名变量，再调用这里的 template。
+只有三个基础入口，共用官方 GPT 训练循环：
 
 | 脚本（`experiments/xcx/configs/`） | 用途 |
 | --- | --- |
-| `moe_pretrain_template.sh` | 公共模型、数据、torchrun、训练和输出配置 |
+| `moe_pretrain_template.sh` | YuLan 模板在 0.20 上的适配版 |
 | `pretrain_moe.sh` | 普通 MoE，官方 Aux |
-| `pretrain_earh.sh` | 相同配方，加 EARH 动态行与静态 router |
+| `pretrain_earh.sh` | 相同配方，开启 EARH |
 | `pretrain_kl_aux.sh` | 普通 MoE，global KL、固定 beta=0.7、rho=0 |
-
-template 默认 BF16、local backend、Adam、RMSNorm/SwiGLU/RoPE，8 层、hidden=512、
-8 experts/top-2、序列长度 2048、global batch=32、10000 步。它是可修改的基础配方，
-没有复刻旧脚本的 Muon、融合算子、任务调度或完整论文实验配置。
-MoE 与 EARH 默认共用 `aux_loss`、系数 0.005；KL 保持相同系数。
-
-先设置数据和 tokenizer，再选入口。`DATA_PATH` 是已预处理的 `.bin/.idx` 文件前缀，
-不带后缀；`TOKENIZER_MODEL_PATH` 是本地 HuggingFace tokenizer 目录：
 
 ```bash
 export DATA_PATH=/path/to/data/train_text_document
 export TOKENIZER_MODEL_PATH=/path/to/tokenizer
-export NPROC_PER_NODE=8 EP_SIZE=8
+export OUTPUT_CHECKPOINT_PATH=/path/to/runs
+export GPUS_PER_NODE=8 EP_SIZE=8
 
-OUTPUT_DIR=/path/to/runs/moe bash experiments/xcx/configs/pretrain_moe.sh
-OUTPUT_DIR=/path/to/runs/earh bash experiments/xcx/configs/pretrain_earh.sh
-OUTPUT_DIR=/path/to/runs/kl bash experiments/xcx/configs/pretrain_kl_aux.sh
+bash experiments/xcx/configs/pretrain_moe.sh
+bash experiments/xcx/configs/pretrain_earh.sh
+bash experiments/xcx/configs/pretrain_kl_aux.sh
 ```
 
-模型和训练参数可直接改 template 默认值，或设置 `NUM_LAYERS`、`HIDDEN_SIZE`、
-`NUM_ATTN_HEADS`、`FFN_HIDDEN_SIZE`、`MOE_FFN_HIDDEN_SIZE`、`NUM_EXPERTS`、
-`MOE_TOPK`、`SEQ_LEN`、`MICRO_BATCH_SIZE`、`GLOBAL_BATCH_SIZE`、`TRAIN_ITERS`、
-`LR`、`MIN_LR`、`LR_WARMUP_ITERS`、`SEED`。并行使用 `TP_SIZE/PP_SIZE/CP_SIZE/EP_SIZE`。
-其余参数直接追加官方 CLI，重复的普通选项以后面的值为准；不使用 `EXTRA_ARGS` 字符串或 eval。
-切换与默认互斥的配置（如按 samples 训练）时，直接改 template 对应项。
+`DATA_PATH` 是 `.bin/.idx` 前缀，不带后缀；`TOKENIZER_MODEL_PATH` 是本地
+HuggingFace tokenizer 目录。`TOKENIZER_TYPE=LLamaTokenizer` 沿用旧拼写，映射到
+官方 `HuggingFaceTokenizer`。独立数据集仍用 `TRAIN_DATA_PATH/VALID_DATA_PATH`。
+`TOKENIZER_TYPE=mock` 使用官方 mock data，无 tokenizer 目录时使用 NullTokenizer。
+
+模型参数仍用 `NUM_LAYERS/HIDDEN_SIZE/NUM_ATTN_HEADS/NUM_QUERY_GROUPS`、
+`FFN_HIDDEN_SIZE/MOE_FFN_HIDDEN_SIZE/NUM_EXPERTS/MOE_TOPK`。
+训练仍用 `SEQ_LEN/BATCH_SIZE/GLOBAL_BATCH_SIZE` 和
+`TRAIN_TOKENS/LR_WARMUP_TOKENS/LR_DECAY_TOKENS/SAVE_TOKENS/EVAL_TOKENS`，
+支持数字中的下划线，按原模板向下取整换算 samples 和 interval；保存、评测预算至少覆盖一个 batch。
+并行仍用 `MP_SIZE/PP_SIZE/CP_SIZE/EP_SIZE`。
+
+默认 BF16、local backend、Adam、8 层、hidden=512、8 experts/top-2、序列长度 2048、
+global batch=32、训练 655,360,000 tokens（10000 步），Aux 系数 0.005。
+`USE_DDP_OVERLAP=false`、`LOSS_MASK_ENABLE=false`；Adam 默认使用普通 optimizer，
+设置 `USE_DISTRIBUTED_OPTIMIZER=true` 可开启官方 distributed optimizer。当前缺少 TE/Apex 的
+Torch optimizer fallback 在 distributed optimizer 续训时触发官方状态断言，因此未作为基础脚本默认值。`ASYNC_SAVE=true` 才启用官方异步保存。
+`TRANSFORMER_IMPL=transformer_engine` 选择 TE 和 grouped GEMM，需要安装对应依赖；实测为 local/Adam。
+Muon 使用 0.20 的原生选项，依赖 emerging_optimizers；旧 `spectral_mup/blockwise` 值不做隐式替换。
+
+算法继续通过原变量选择，也保留 `EXTRA_ARGS` 字符串和追加 CLI；字符串用 shlex 解析，
+支持引号，不执行 shell 表达式。追加的 CLI 位于最后。
+影响实验命名的参数优先用环境变量设置，避免 CLI 覆盖后目录名仍体现模板中的配置。
 
 ```bash
-# EARH detach-gate；其它梯度模式与 aux-free 参数沿用下方 EARH 说明。
-OUTPUT_DIR=/path/to/runs/earh-probe bash experiments/xcx/configs/pretrain_earh.sh \
-    --moe-router-grad-mode probe_only
-# Global KL 完整步反馈和动态 beta；范围、步长等沿用 KL Aux 说明。
-OUTPUT_DIR=/path/to/runs/kl-dynamic bash experiments/xcx/configs/pretrain_kl_aux.sh \
-    --moe-router-global-aux-mode previous_step --moe-router-sym-kl-loss-dynamic-beta
+# EARH 梯度模式与官方 aux-free bias
+LOAD_BALANCING=dsv3 MOE_ROUTER_GRAD_MODE=probe_only \
+    bash experiments/xcx/configs/pretrain_earh.sh
+
+# Global KL 完整步反馈与动态 beta
+MOE_ROUTER_GLOBAL_AUX_MODE=previous_step MOE_ROUTER_SYM_KL_LOSS_DYNAMIC_BETA=true \
+    bash experiments/xcx/configs/pretrain_kl_aux.sh
+
+# 加权 blend 或更多已迁移参数可继续用 EXTRA_ARGS
+EXTRA_ARGS='--data-path 0.7 /data/a 0.3 "/data/b with spaces"' \
+    bash experiments/xcx/configs/pretrain_moe.sh
 ```
 
-默认输出在已被 Git 忽略的 `runs/xcx/<入口名>/`，包含 checkpoints、TensorBoard 和
-dataset cache；每组实验设置独立 `OUTPUT_DIR`。续训显式追加
-`--load /path/to/runs/earh/checkpoints`。没有自动恢复、自动换优化器或 FP8 开关。
-`TRANSFORMER_IMPL=transformer_engine` 可选择官方 TE backend，grouped GEMM 等继续用
-原参数配置；当前实测配方仍为 local/Adam。
+输出沿用 `${OUTPUT_CHECKPOINT_PATH}/checkpoint/${NAME}` 和 `log/${JOB_ID}_${NAME}g...`，
+默认根目录为 `runs/xcx/`。三个入口使用不同 `NAME_PREFIX`，也可自行指定。
+已有 checkpoint 自动恢复；第 1 步 marker 仍按旧模板视为初始化标记，从头训练。
+`PRETRAIN_CHECKPOINT_PATH` 保留加载其他 checkpoint 的接口，但不支持旧
+`--reset-iteration-one-to-zero` 的特殊语义。仅延长 `TRAIN_TOKENS` 不改变 checkpoint 名称；
+需要替换 checkpoint 中的 LR 调度时显式加 `--override-opt_param-scheduler`。
+YuLan 旧 checkpoint 的权重/optimizer 格式兼容性不在本次脚本适配范围内。
 
-多机设置相同的 `NNODES`、`NPROC_PER_NODE`、`MASTER_ADDR`、`MASTER_PORT`（默认 6000），
-每台分别设置 `NODE_RANK`，数据/tokenizer/输出路径应可被各节点访问。单机自动使用
-`--standalone`。加权 blend、多份 train/valid 数据可不设置 `DATA_PATH`，直接追加
-`--data-path 0.7 /prefix1 0.3 /prefix2` 或官方 `--train-data-path/--valid-data-path`。
-也可不设置 `TOKENIZER_MODEL_PATH`，直接追加 tokenizer 参数。
+多机沿用 `NNODES/GPUS_PER_NODE/MASTER_ADDR/MASTER_PORT/NODE_RANK`，也接受
+`PET_NNODES/PET_NODE_RANK`。各节点设置相同 `TASK_UUID`，不额外引入旧 job UUID 协调脚本。
+
+已去掉旧版本专属参数和 benchmark/SwanLab 接线。尚未迁移的 GDN、Routing-Free/AoE、ERC、
+loss mask、logits/topk-boundary proxy、raw top-k combine、dead-neuron monitor 等，
+通过旧变量启用会报错。普通 `global_aux_loss` 目前仅对应官方 prefix 统计，需显式设置
+`MOE_ROUTER_GLOBAL_AUX_MODE=legacy_prefix`；KL 的 microbatch/previous_step/legacy_prefix 均已迁移。
+模板不再包含旧凭据注释、全量环境转储或默认 shell trace。
 
 ## 异步日志
 
@@ -667,12 +690,19 @@ EARH 复现检查补充（2026-11-12）：先完成普通 global Aux 反馈与�
   新增能力检查测试在 2.6 下 6 项通过、1 项因缺少 dtype 跳过；2.10 下 7 项通过，
   232 项实验回归及 GPU E8M0 字节转换 replay 通过。未变更 FP8 数值 kernel。
 
-- 训练 template：10 项脚本/原生参数检查通过，覆盖路径空格、覆盖默认项、aux-free、
+- 训练 template（初版）：10 项脚本/原生参数检查通过，覆盖路径空格、覆盖默认项、aux-free、
   per-split 数据、多机 rendezvous 和必需输入。Torch 2.6 下用本地 HF tokenizer 和
   人工小型 indexed dataset（未启用 mock data）跑通 MoE、EARH、双卡 EP=2 global KL
   三个入口及独立 train/valid 路径，均训练两步并保存 checkpoint。KL 从第 2 步恢复至
   第 4 步，6 条 KL/beta 日志和负载指标步号连续；相应 PyTorch checkpoint API 兼容
   保持 common/sharded load 的本地读取语义。未改模型、路由算法或训练循环。
+
+- YuLan 模板复制适配：17 项脚本检查通过，覆盖原变量、token 预算、EXTRA_ARGS 引号、
+  自动续训、per-split 数据、多机参数、aux-free 和训练失败退出码。真实 Torch 2.6 + BF16 +
+  local/普通 Adam 下，MoE、EARH、双卡 EP=2 global KL 均用 indexed dataset 训练两步并保存；
+  KL 仅延长 TRAIN_TOKENS 后自动恢复至第 4 步，6 条 KL/beta 指标步号连续，loss 均有限。
+  无 TE/Apex 时 distributed optimizer 的恢复状态断言保留为已知限制，因此默认关闭该选项。
+  本批未修改 Core 或训练循环。
 
 异步日志的 CPU 检查不依赖官方 GPU 单测 fixtures，可单独运行：
 
