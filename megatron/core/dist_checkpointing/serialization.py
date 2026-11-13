@@ -34,6 +34,7 @@ from .strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
     _get_filesystem_reader,
+    _load_state_dict_no_dist,
 )
 from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
 from .validation import (
@@ -216,9 +217,7 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
 
     unique_key = ShardedObject("common_state", None, (1,), (0,)).unique_key
     pyt_state_dict = {unique_key: io.BytesIO()}
-    torch.distributed.checkpoint.load(
-        pyt_state_dict, storage_reader=_get_filesystem_reader(checkpoint_dir), no_dist=True
-    )
+    _load_state_dict_no_dist(pyt_state_dict, _get_filesystem_reader(checkpoint_dir))
 
     loaded = pyt_state_dict[unique_key]
     if isinstance(loaded, io.BytesIO):

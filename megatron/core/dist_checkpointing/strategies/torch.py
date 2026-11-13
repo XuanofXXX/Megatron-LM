@@ -839,6 +839,14 @@ def _get_filesystem_reader(
     return FileSystemReader(checkpoint_dir)
 
 
+def _load_state_dict_no_dist(state_dict, storage_reader, planner=None):
+    """Use PyTorch's local-only load API across supported versions."""
+    load_fn = checkpoint.load
+    if "no_dist" not in inspect.signature(load_fn).parameters:
+        load_fn = checkpoint.load_state_dict
+    return load_fn(state_dict, storage_reader=storage_reader, planner=planner, no_dist=True)
+
+
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
@@ -876,7 +884,7 @@ class TorchDistLoadShardedStrategy:
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
         fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=self.cache_metadata)
-        checkpoint.load(
+        _load_state_dict_no_dist(
             pyt_state_dict,
             fsr,
             planner=MCoreLoadPlanner(
@@ -885,7 +893,6 @@ class TorchDistLoadShardedStrategy:
                 flatten_state_dict=False,
                 flatten_sharded_tensors=False,
             ),
-            no_dist=True,
         )
 
         if self.cache_metadata:

@@ -26,6 +26,7 @@ from megatron.core.dist_checkpointing import (
     load_content_metadata,
     remove_sharded_tensors,
     save,
+    serialization,
 )
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import diff
@@ -39,11 +40,49 @@ from megatron.core.dist_checkpointing.serialization import (
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
+    _load_state_dict_no_dist,
 )
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize("modern_api", [False, True])
+@pytest.mark.parametrize("sharded", [False, True])
+def test_common_state_load_remains_local_on_both_torch_apis(monkeypatch, modern_api, sharded):
+    common = {"iteration": 2}
+    calls = []
+
+    planner = object() if sharded else None
+
+    def modern(state_dict, *, storage_reader, no_dist, planner=None):
+        calls.append("modern")
+        assert storage_reader == "reader" and no_dist is True
+        calls.append(planner)
+        state_dict[next(iter(state_dict))] = [common]
+
+    def older(state_dict, *, storage_reader):
+        pytest.fail("older load() cannot accept no_dist; use load_state_dict()")
+
+    def legacy(state_dict, storage_reader, *, no_dist, planner=None):
+        calls.append("legacy")
+        assert storage_reader == "reader" and no_dist is True
+        calls.append(planner)
+        state_dict[next(iter(state_dict))] = [common]
+
+    monkeypatch.setattr(serialization, "verify_checkpoint", lambda path: None)
+    monkeypatch.setattr(serialization, "_legacy_common_state_exists", lambda path: False)
+    monkeypatch.setattr(serialization, "_get_filesystem_reader", lambda path: "reader")
+    monkeypatch.setattr(torch.distributed.checkpoint, "load", modern if modern_api else older)
+    monkeypatch.setattr(torch.distributed.checkpoint, "load_state_dict", legacy)
+    if sharded:
+        state_dict = {"key": None}
+        _load_state_dict_no_dist(state_dict, "reader", planner=planner)
+        assert state_dict == {"key": [common]}
+    else:
+        assert serialization.load_common_state_dict("checkpoint") == common
+    assert calls == ["modern" if modern_api else "legacy", planner]
 
 
 class TestSerialization:
