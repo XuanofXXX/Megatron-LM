@@ -245,6 +245,19 @@ def test_batch_invariant_inference_activations_replay():
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
+def test_mxfp8_scale_dtype_conversion_replays():
+    from megatron.core.inference.quantization.mxfp8_tensor import ensure_mxfp8_scale_dtype
+
+    raw = torch.arange(256, dtype=torch.uint8, device="cuda")
+    assert_replays_bit_exact(
+        lambda value: ensure_mxfp8_scale_dtype(value).view(torch.uint8),
+        (raw,),
+        backward=False,
+        what="MXFP8 scale dtype conversion",
+    )
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
 def test_mxfp8_quantize_replays():
     from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
 

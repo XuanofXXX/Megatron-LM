@@ -22,6 +22,11 @@ bash experiments/xcx/configs/baseline.sh
 以后面的值为准。它使用 local backend 和 FP32，便于检查入口，不用于性能比较。
 实际训练环境按照仓库 `skills/mcore-build-and-dependency/SKILL.md` 准备。
 
+Torch 2.6 的普通 BF16 MoE/EARH 不需要 E8M0 dtype。Core 的
+`inference/quantization/mxfp8_tensor.py` 增加局部能力检查，避免未启用 MXFP8 时因
+缺少 `torch.float8_e8m0fnu` 而导入失败；真正使用 Triton MXFP8 时才检查该能力并报错。
+不用增加实验开关，也不改训练计算路径。
+
 检查保存和恢复时使用新的输出目录。第二次运行把总训练步数从 4 增加到 6，
 因此显式使用当前参数重设学习率调度器；沿用原训练计划续训时无需该选项：
 
@@ -596,6 +601,12 @@ EARH 复现检查补充（2026-11-12）：先完成普通 global Aux 反馈与�
   相同 sigmoid 的无 bias/Aux 对照）；checkpoint 确认冻结 probe 保持初值，静态 router
   与 expert gate 均有更新，bias 以 FP32 保存并更新。EP=2 + BF16 + full recompute +
   probe_only/aux-free 保存第 2 步并恢复到第 4 步，负载日志步号连续。本批仅新增测试和说明。
+
+- Torch 2.6 兼容检查：真实 `2.6.0+cu124`、缺少 E8M0 dtype 的环境下，普通 MoE、
+  EARH/global previous-step KL/动态 beta、EARH/probe_only/aux-free 均通过两步 BF16
+  mock-data 训练（A800、local backend、Adam）；KL 配置还保存了第 2 步 checkpoint。
+  新增能力检查测试在 2.6 下 6 项通过、1 项因缺少 dtype 跳过；2.10 下 7 项通过，
+  232 项实验回归及 GPU E8M0 字节转换 replay 通过。未变更 FP8 数值 kernel。
 
 异步日志的 CPU 检查不依赖官方 GPU 单测 fixtures，可单独运行：
 

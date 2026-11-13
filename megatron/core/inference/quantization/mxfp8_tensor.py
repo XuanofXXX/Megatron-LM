@@ -29,14 +29,25 @@ def _ceil_div(a, b):
     return (a + b - 1) // b
 
 
+def _require_e8m0_dtype() -> torch.dtype:
+    dtype = getattr(torch, "float8_e8m0fnu", None)
+    if dtype is None:
+        raise RuntimeError(
+            "MXFP8 E8M0 scales require a PyTorch build exposing torch.float8_e8m0fnu. "
+            "Disable MXFP8 to use ordinary BF16/FP16 training."
+        )
+    return dtype
+
+
 def ensure_mxfp8_scale_dtype(scale: torch.Tensor) -> torch.Tensor:
     """Return the E8M0 view required by PyTorch scaled GEMM APIs.
 
     FlashInfer exposes the same MXFP8 scale bytes as ``uint8``.
     """
+    e8m0_dtype = _require_e8m0_dtype()
     if scale.dtype == torch.uint8:
-        return scale.view(torch.float8_e8m0fnu)
-    if scale.dtype != torch.float8_e8m0fnu:
+        return scale.view(e8m0_dtype)
+    if scale.dtype != e8m0_dtype:
         raise TypeError(
             "MXFP8 scales must use torch.float8_e8m0fnu or its uint8 byte "
             f"representation, got {scale.dtype}."
@@ -45,9 +56,10 @@ def ensure_mxfp8_scale_dtype(scale: torch.Tensor) -> torch.Tensor:
 
 
 MXFP8Backend = Literal["flashinfer", "triton"]
-_MXFP8_SCALE_DTYPES: dict[MXFP8Backend, torch.dtype] = {
+# Optional inference dtypes must not prevent importing ordinary BF16 MoE training.
+_MXFP8_SCALE_DTYPES: dict[MXFP8Backend, Optional[torch.dtype]] = {
     "flashinfer": torch.uint8,
-    "triton": torch.float8_e8m0fnu,
+    "triton": getattr(torch, "float8_e8m0fnu", None),
 }
 
 
@@ -73,6 +85,8 @@ def validate_mxfp8_tensor(
             f"{tensor_name} backend is {tensor.backend!r}; expected "
             f"{expected_backend!r} for the configured GEMM consumer."
         )
+    if backend == "triton":
+        _require_e8m0_dtype()
     expected_scale_dtype = _MXFP8_SCALE_DTYPES.get(backend)
     if expected_scale_dtype is None:
         raise ValueError(
@@ -182,6 +196,8 @@ class MXFP8Tensor:
             )
         if self.backend is None:
             raise ValueError("Cannot update an MXFP8Tensor without a quantization backend.")
+        if self.backend == "triton":
+            _require_e8m0_dtype()
         value = value.to(device=self.device)
         if self.backend == "flashinfer" and value.dtype == torch.float32:
             value = value.to(dtype=torch.bfloat16)
@@ -228,12 +244,14 @@ class MXFP8Tensor:
             backend: 'triton' (fused quantize + swizzle Triton kernel) or
                      'flashinfer' (single fused FlashInfer CUDA kernel).
         """
+        if backend == "triton":
+            _require_e8m0_dtype()
         assert x.is_cuda and x.dim() == 2
         assert x.shape[-1] % group_size == 0
         if backend == "flashinfer":
             assert HAVE_FLASHINFER, "FlashInfer not available"
             data, scale = flashinfer_mxfp8_quantize(x)
-            if scale.dtype == torch.float8_e8m0fnu:
+            if scale.dtype == getattr(torch, "float8_e8m0fnu", None):
                 scale = scale.view(torch.uint8)
             elif scale.dtype != torch.uint8:
                 raise TypeError(f"FlashInfer MXFP8 scales must be uint8 bytes, got {scale.dtype}.")
